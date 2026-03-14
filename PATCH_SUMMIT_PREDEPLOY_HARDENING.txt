@@ -1,0 +1,12 @@
+PATCH: Summit pre-deploy hardening
+- Founder handoff endpoint added
+- Dedicated founder handoff rate limit
+- Thread ownership/membership validation for handoff
+- STT language made summit-aware (SUMMIT_STT_LANGUAGE / SUMMIT_MODE)
+- Frontend handoff CTA + cooldown state
+- Frontend STT language now explicit via env when configured
+Recommended env:
+FOUNDER_HANDOFF_MAX_PER_10M=3
+SUMMIT_MODE=true
+SUMMIT_STT_LANGUAGE=pt-BR   # only if Summit training/demo should favor PT-BR
+OPENAI_STT_LANGUAGE=auto    # for broader/global use

@@ -1,0 +1,8 @@
+PATCH0104_29_3-STREAMING-THROUGHPUT
+
+PATCH0108: _openai_answer retorna code SERVER_BUSY/TIMEOUT para SSE retry policy.
+
+PATCH0200_SUMMIT_RELEASE: Consolidated Summit hardening (CORS safe default, SSE streaming compat, MAX_STREAM_SECONDS hard stop, context/history limits, admission control per replica with MAX_STREAMS_PER_REPLICA alias, structured stream_start/stream_end logs).
+
+
+PATCH0201_FIX: Procfile Railway-compatible port expansion (use $PORT, no bash default syntax).
