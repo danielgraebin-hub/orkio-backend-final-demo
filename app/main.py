@@ -418,10 +418,10 @@ def _seed_default_summit_codes(db: Session, org: str = "public") -> None:
     """
     seeds = [
         {
-            "id": "seed_summit2026_public",
-            "plain_code": "SUMMIT2026",
-            "label": "Participante Summit",
-            "source": "invite",
+            "id": "seed_southsummit26_public",
+            "plain_code": "SOUTHSUMMIT26",
+            "label": "South Summit User",
+            "source": "summit_user",
             "max_uses": 5000,
             "expires_days": 30,
             "created_by": "system_seed",
@@ -429,8 +429,8 @@ def _seed_default_summit_codes(db: Session, org: str = "public") -> None:
         {
             "id": "seed_efata777_public",
             "plain_code": "EFATA777",
-            "label": "Investidor",
-            "source": "invite",
+            "label": "Investor",
+            "source": "investor",
             "max_uses": 200,
             "expires_days": 90,
             "created_by": "system_seed",
@@ -1779,6 +1779,11 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     org = (get_org(x_org_slug) if x_org_slug else (inp.tenant or default_tenant())).strip()
     email = inp.email.lower().strip()
 
+    # Structural super-admin rule:
+    # - configured ADMIN_EMAILS always become admin
+    # - if no admin exists in the org yet, first user becomes admin
+    should_be_admin = _should_promote_to_admin(db, org, email)
+
     # PATCH0100_28: Rate limit registration
     if not _rate_limit_check(_rl_register_lock, _rl_register_calls, ip, _REGISTER_MAX_PER_MINUTE):
         raise HTTPException(status_code=429, detail="Muitas tentativas de registro. Aguarde 1 minuto.")
@@ -1793,7 +1798,8 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     signup_code_label = None
     signup_source = None
     usage_tier = "summit_standard"
-    if SUMMIT_MODE:
+
+    if SUMMIT_MODE and not should_be_admin:
         if not inp.access_code:
             logger.warning("REGISTER_DENIED reason=missing_code ip=%s org=%s", ip, org)
             raise HTTPException(status_code=403, detail="Código de acesso obrigatório no modo Summit.")
@@ -1803,28 +1809,27 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
             raise HTTPException(status_code=403, detail="Código de acesso inválido, expirado ou esgotado.")
         signup_code_label = sc.label
         signup_source = sc.source
-        # Summit registration window enforcement
+
         if now_ts() > int(SUMMIT_EXPIRES_AT):
             raise HTTPException(status_code=403, detail="Período de acesso ao Summit encerrado.")
-        # VIP rules: invite code (efata777 / source=invite) grants VIP; pitch code remains standard
-        if (sc.source or "").lower() == "invite" or (sc.label or "").lower() == "efata777":
-            usage_tier = "summit_vip"
 
-    elif inp.access_code:
-        # Non-summit mode but code provided — validate if exists
+        source_key = (sc.source or "").strip().lower()
+        if source_key == "investor":
+            usage_tier = "summit_vip"
+        elif source_key == "summit_user":
+            usage_tier = "summit_standard"
+
+    elif inp.access_code and not should_be_admin:
         sc = _validate_access_code(db, org, inp.access_code)
         if sc:
             signup_code_label = sc.label
             signup_source = sc.source
 
-    # PATCH0100_28: Terms acceptance
-    if SUMMIT_MODE and not inp.accept_terms:
+    if SUMMIT_MODE and not inp.accept_terms and not should_be_admin:
         logger.warning("REGISTER_DENIED reason=terms_not_accepted ip=%s org=%s", ip, org)
         raise HTTPException(status_code=400, detail="Você precisa aceitar os Termos de Uso para continuar.")
 
-    # auto-admin
-    is_admin_email = email in admin_emails()
-    role = "admin" if is_admin_email else "user"
+    role = "admin" if should_be_admin else "user"
 
     existing = db.execute(select(User).where(User.org_slug == org, User.email == email)).scalar_one_or_none()
     if existing:
@@ -1845,7 +1850,6 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     db.add(u)
     db.commit()
 
-    # Record terms acceptance
     if inp.accept_terms:
         try:
             db.add(TermsAcceptance(
@@ -1857,7 +1861,6 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
         except Exception:
             logger.exception("TERMS_ACCEPTANCE_RECORD_FAILED")
 
-    # Record marketing consent
     if inp.marketing_consent:
         try:
             db.add(MarketingConsent(
@@ -1869,8 +1872,18 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
             logger.exception("MARKETING_CONSENT_RECORD_FAILED")
 
     try:
-        audit(db, org, u.id, "user.register", request_id="reg", path="/api/auth/register", status_code=200, latency_ms=0,
-              meta={"email": u.email, "signup_code_label": signup_code_label, "signup_source": signup_source, "usage_tier": usage_tier, "summit_mode": SUMMIT_MODE})
+        audit(
+            db, org, u.id, "user.register",
+            request_id="reg", path="/api/auth/register", status_code=200, latency_ms=0,
+            meta={
+                "email": u.email,
+                "signup_code_label": signup_code_label,
+                "signup_source": signup_source,
+                "usage_tier": usage_tier,
+                "summit_mode": SUMMIT_MODE,
+                "role": u.role,
+            }
+        )
     except Exception:
         pass
 
@@ -1879,12 +1892,14 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
             db.add(u)
             db.commit()
     except Exception:
-        logger.exception("ADMIN_SYNC_FAILED login_verify_otp user_id=%s", getattr(u, "id", None))
-    token = mint_token({"sub": u.id, "org": org, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier})
+        logger.exception("ADMIN_SYNC_FAILED register user_id=%s", getattr(u, "id", None))
 
-    # Create user session for presence tracking
+    token = mint_token({
+        "sub": u.id, "org": org, "email": u.email, "name": u.name,
+        "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier
+    })
+
     _create_user_session(db, u.id, org, ip, signup_code_label, usage_tier)
-
     return {"access_token": token, "token_type": "bearer", "user": {"id": u.id, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier}}
 
 @app.post("/api/auth/login")
